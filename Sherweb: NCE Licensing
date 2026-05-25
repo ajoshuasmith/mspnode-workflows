@@ -1,0 +1,993 @@
+{
+  "name": "Sherweb: NCE Licensing",
+  "nodes": [
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        5424,
+        1600
+      ],
+      "name": "Loop Over Items",
+      "id": "6ced12f5-59c3-4360-a498-6e728cafcc36"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        5648,
+        1072
+      ],
+      "name": "Done",
+      "id": "43da6f61-8b99-4380-baef-85363675732d"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "has-sherweb-id",
+              "leftValue": "={{ $json.identifiers?.sherwebId }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "notEmpty"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        5648,
+        1264
+      ],
+      "name": "Has Sherweb ID?",
+      "id": "cd23a6d7-98c1-4735-a371-38d154f8c803",
+      "notes": "Only process customers with a Sherweb ID in Hudu. CIPP-only tenants are skipped."
+    },
+    {
+      "parameters": {
+        "operation": "getLicenses",
+        "tenantFilter": {
+          "__rl": true,
+          "value": "={{ $json.domainName }}",
+          "mode": "id"
+        },
+        "returnAll": true,
+        "licenseOptions": {
+          "summaryOnly": true
+        }
+      },
+      "type": "@joshuanode/n8n-nodes-cipp.cippApp",
+      "typeVersion": 1,
+      "position": [
+        5872,
+        1264
+      ],
+      "name": "Get Licenses (CIPP)",
+      "retryOnFail": true,
+      "maxTries": 5,
+      "id": "15d56edc-0b86-4a5d-adc4-f7e1c94d0f12",
+      "credentials": {
+        "cippApi": {
+          "id": "zub0mVW7DkSqgVYz",
+          "name": "CIPP account 2"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Analyze CIPP licenses for both upsell (60 days) and optimization (post-renewal)\n// Version: v7.1 - Fixed commitment type handling + date validation for requiredDate field\n// Input: Licenses from CIPP, Company data from v5 sub-workflow\n// Output: Analysis with ALL licenses (with status indicators) + specific opportunities\n// Includes: Enterprise E3 security upsell, 300-user Business limit check\n// NCE Rules:\n//   - Monthly: Can reduce starting CIPP day 0 (day before Sherweb renewal) through day -7\n//   - Annual: Can only reduce starting CIPP day -1 (Sherweb renewal date) through day -7\n// Note: CIPP's day 0 = termEndDate, Sherweb renewal = termEndDate + 1 day\n\n// =============================================================================\n// MSP CONFIGURATION - CUSTOMIZE THESE VALUES FOR YOUR ORGANIZATION\n// =============================================================================\n// Update these settings to match your MSP's standard license offerings and\n// messaging preferences. These values control how the workflow identifies\n// opportunities and what recommendations it makes.\n\nconst MSP_CONFIG = {\n  // Your MSP's standard/recommended license SKUs (used to identify non-standard licenses)\n  standardLicenses: [\n    'Microsoft 365 Business Premium',\n    'Microsoft 365 E3',\n    'Microsoft 365 E5'\n  ],\n  \n  // Licenses you typically recommend upgrading TO\n  recommendedUpgrades: {\n    'business basic': 'Microsoft 365 Business Premium',\n    'business standard': 'Microsoft 365 Business Premium',\n    'office 365 e1': 'Microsoft 365 E3',\n    'office 365 e3': 'Microsoft 365 E3'\n  },\n  \n  // Custom messages for ticket notes (customize for your branding)\n  messages: {\n    upgradeRecommendation: 'Consider upgrading to your standard license package',\n    unusedLicenses: 'Review unused licenses with customer before renewal',\n    e3Security: 'Recommend E5 Security add-on for enhanced Defender and Entra ID P2',\n    businessLimit: 'Approaching 300-user Business limit - plan Enterprise migration',\n    nonStandardLicense: 'Non-standard license detected - verify if this meets customer needs'\n  },\n  \n  // Workflow timing settings\n  upsellWindowDays: 60,           // Days before renewal to flag for customer contact\n  businessUserWarningThreshold: 250,  // Warn when Business users exceed this count\n  businessUserLimit: 300              // Hard limit for Business SKUs\n};\n\n// =============================================================================\n// END MSP CONFIGURATION - Do not modify below unless you know what you're doing\n// =============================================================================\n\nconst licenses = $input.all().map(i => i.json);\nconst customer = $('Loop Over Items').item.json;\n\nconst today = new Date();\nconst UPSELL_WINDOW_DAYS = MSP_CONFIG.upsellWindowDays;\nconst OPTIMIZATION_WINDOW_START_MONTHLY = 0;  // CIPP day 0 = day before Sherweb renewal (can reduce early)\nconst OPTIMIZATION_WINDOW_START_ANNUAL = -1;  // CIPP day -1 = Sherweb renewal date (unlocks here)\nconst OPTIMIZATION_WINDOW_END = -7;           // 7 days after renewal (NCE cancellation window)\nconst BUSINESS_USER_LIMIT = MSP_CONFIG.businessUserLimit;\nconst BUSINESS_USER_WARNING_THRESHOLD = MSP_CONFIG.businessUserWarningThreshold; // Warn when approaching limit\n\n// Track ALL licenses with status indicators\nconst allLicenses = [];\n\n// Track specific opportunities (for automation)\nconst upsellOpportunities = [];\nconst optimizationOpportunities = [];\n\n// Track license type totals for limit checks\nlet totalBusinessPremiumUsers = 0;\nlet totalE3Users = 0;\nlet hasE5Security = false;\nlet e5SecurityCount = 0;\n\n// Helper: Check if license is a candidate for Premium upgrade (Business Basic/Standard)\nconst isUpgradeCandidate = (licenseName) => {\n  const name = licenseName.toLowerCase();\n  return name.includes('business basic') || name.includes('business standard');\n};\n\n// Helper: Check if license is Business Premium\nconst isBusinessPremium = (licenseName) => {\n  const name = licenseName.toLowerCase();\n  return name.includes('business premium') || name.includes('spb');\n};\n\n// Helper: Check if license becomes redundant with Premium\nconst isRedundantWithPremium = (licenseName) => {\n  const name = licenseName.toLowerCase();\n  // Defender Plan 1 is included in Business Premium\n  return name.includes('defender for office 365') && name.includes('plan 1');\n};\n\n// Helper: Check if license is Microsoft 365 E3\nconst isEnterpriseE3 = (licenseName) => {\n  const name = licenseName.toLowerCase();\n  return (name.includes('microsoft 365 e3') ||\n          name.includes('office 365 e3') ||\n          name.includes('enterprisepack'));\n};\n\n// Helper: Check if license is E5 Security add-on\nconst isE5Security = (licenseName) => {\n  const name = licenseName.toLowerCase();\n  return (name.includes('e5 security') ||\n          name.includes('identity_threat_protection') ||\n          name.includes('microsoft 365 e5 security'));\n};\n\nfor (const license of licenses) {\n  const totalLicenses = parseInt(license.TotalLicenses) || 0;\n  const usedLicenses = parseInt(license.CountUsed) || 0;\n  const unusedCount = totalLicenses - usedLicenses;\n  const licenseName = license.License || license.skuPartNumber;\n\n  // Track totals for limit checks (regardless of term info)\n  if (isBusinessPremium(licenseName)) {\n    totalBusinessPremiumUsers += usedLicenses;\n  }\n  if (isEnterpriseE3(licenseName)) {\n    totalE3Users += usedLicenses;\n  }\n  if (isE5Security(licenseName)) {\n    hasE5Security = true;\n    e5SecurityCount += usedLicenses;\n  }\n\n  // Get term info for status determination\n  const termInfo = license.TermInfo;\n  const daysUntilRenewal = termInfo?.DaysUntilRenew;\n  const term = termInfo?.Term || '';\n  const isTrial = termInfo?.IsTrial || false;\n  const status = termInfo?.Status || 'Unknown';\n\n  // Determine license status/window\n  let windowStatus = 'outside';\n  let statusNote = '';\n  let isValidNCE = false;\n\n  if (!termInfo) {\n    statusNote = 'No term info';\n  } else if (isTrial) {\n    statusNote = 'Trial license';\n  } else if (term.toLowerCase().includes('unknown') || term.toLowerCase().includes('non-nce')) {\n    statusNote = 'Non-NCE license';\n  } else if (daysUntilRenewal == null) {\n    statusNote = 'No renewal date';\n  } else if (daysUntilRenewal < OPTIMIZATION_WINDOW_END) {\n    statusNote = status === 'Suspended' ? 'Suspended' : 'Past cancellation window';\n  } else {\n    isValidNCE = true;\n\n    // Check commitment type: Monthly = month-to-month (flexible), Yearly = annual commitment (locked)\n    const isMonthlyCommitment = term.toLowerCase().includes('monthly');\n    const isAnnualCommitment = term.toLowerCase().includes('yearly') || term.toLowerCase().includes('annual');\n\n    if (isMonthlyCommitment) {\n      // Monthly commitment: Reduce day before Sherweb renewal (CIPP day 0) through day -7\n      if (daysUntilRenewal <= OPTIMIZATION_WINDOW_START_MONTHLY && daysUntilRenewal >= OPTIMIZATION_WINDOW_END) {\n        windowStatus = 'optimization';\n        statusNote = 'Monthly commitment - in reduction window';\n      } else if (daysUntilRenewal <= UPSELL_WINDOW_DAYS && daysUntilRenewal > OPTIMIZATION_WINDOW_START_MONTHLY) {\n        windowStatus = 'upsell';\n        statusNote = 'Monthly renewal coming - review licenses';\n      } else if (daysUntilRenewal > UPSELL_WINDOW_DAYS) {\n        statusNote = `Renews in ${daysUntilRenewal} days`;\n      } else {\n        statusNote = 'Past reduction window';\n      }\n    } else if (isAnnualCommitment) {\n      // Annual commitment: Window starts at Sherweb renewal date (CIPP day -1) through day -7\n      if (daysUntilRenewal <= OPTIMIZATION_WINDOW_START_ANNUAL && daysUntilRenewal >= OPTIMIZATION_WINDOW_END) {\n        windowStatus = 'optimization';\n        statusNote = 'In NCE cancellation window (can reduce)';\n      } else if (daysUntilRenewal <= UPSELL_WINDOW_DAYS && daysUntilRenewal > OPTIMIZATION_WINDOW_START_ANNUAL) {\n        windowStatus = 'upsell';\n        statusNote = 'Renewing soon - contact customer';\n      } else if (daysUntilRenewal > UPSELL_WINDOW_DAYS) {\n        statusNote = `Renews in ${daysUntilRenewal} days`;\n      } else {\n        statusNote = 'Past cancellation window';\n      }\n    } else {\n      // Unknown commitment type - treat conservatively as annual\n      if (daysUntilRenewal <= OPTIMIZATION_WINDOW_START_ANNUAL && daysUntilRenewal >= OPTIMIZATION_WINDOW_END) {\n        windowStatus = 'optimization';\n        statusNote = 'In NCE cancellation window (can reduce)';\n      } else if (daysUntilRenewal <= UPSELL_WINDOW_DAYS && daysUntilRenewal > OPTIMIZATION_WINDOW_START_ANNUAL) {\n        windowStatus = 'upsell';\n        statusNote = 'Renewing soon - contact customer';\n      } else {\n        statusNote = `Renews in ${daysUntilRenewal} days`;\n      }\n    }\n  }\n\n  const isPremium = isBusinessPremium(licenseName);\n  const canUpgrade = isUpgradeCandidate(licenseName);\n  const redundantWithPremium = isRedundantWithPremium(licenseName);\n  const isE3 = isEnterpriseE3(licenseName);\n\n  // Determine commitment type for display\n  const commitmentType = term.toLowerCase().includes('monthly') ? 'Monthly' :\n                         (term.toLowerCase().includes('yearly') || term.toLowerCase().includes('annual')) ? 'Annual' : 'Unknown';\n\n  // Build license record for ALL licenses display\n  const licenseRecord = {\n    licenseName: licenseName,\n    skuId: license.skuId,\n    currentQuantity: totalLicenses,\n    usedCount: usedLicenses,\n    unusedCount: unusedCount,\n    status: status,\n    windowStatus: windowStatus,\n    statusNote: statusNote,\n    isValidNCE: isValidNCE,\n    isTrial: isTrial,\n    isBusinessPremium: isPremium,\n    canUpgradeToPremium: canUpgrade,\n    redundantWithPremium: redundantWithPremium,\n    isEnterpriseE3: isE3,\n    renewalDate: termInfo?.NextLifecycle || null,\n    daysUntilRenewal: daysUntilRenewal,\n    term: term,\n    commitmentType: commitmentType,\n    subscriptionId: termInfo?.SubscriptionId,\n    cspSubscriptionId: termInfo?.CSPSubscriptionId\n  };\n\n  allLicenses.push(licenseRecord);\n\n  // Only add to specific opportunity arrays if valid NCE\n  if (!isValidNCE) continue;\n\n  // UPSELL OPPORTUNITY (60 days out, down to Sherweb renewal date)\n  // For Annual: Contact before renewal to discuss needs\n  // For Monthly: Still relevant to discuss upcoming renewal, but less urgent\n  const isInUpsellWindow = daysUntilRenewal <= UPSELL_WINDOW_DAYS && daysUntilRenewal > OPTIMIZATION_WINDOW_START_ANNUAL;\n  if (isInUpsellWindow) {\n    upsellOpportunities.push({\n      ...licenseRecord,\n      needsE5Security: isE3 && !hasE5Security\n    });\n  }\n\n  // OPTIMIZATION OPPORTUNITY\n  // Monthly commitment: Reduce day before Sherweb renewal (CIPP day 0) through day -7\n  // Annual commitment: Reduce on Sherweb renewal date (CIPP day -1) through day -7\n  const isMonthlyTerm = term.toLowerCase().includes('monthly');\n  const canOptimizeMonthly = isMonthlyTerm && daysUntilRenewal <= OPTIMIZATION_WINDOW_START_MONTHLY && daysUntilRenewal >= OPTIMIZATION_WINDOW_END && unusedCount > 0 && totalLicenses > 1;\n  const canOptimizeAnnual = !isMonthlyTerm && daysUntilRenewal <= OPTIMIZATION_WINDOW_START_ANNUAL && daysUntilRenewal >= OPTIMIZATION_WINDOW_END && unusedCount > 0 && totalLicenses > 1;\n\n  if (canOptimizeMonthly || canOptimizeAnnual) {\n    const newQuantity = Math.max(1, usedLicenses);\n\n    optimizationOpportunities.push({\n      ...licenseRecord,\n      newQuantity: newQuantity,\n      reductionAmount: totalLicenses - newQuantity\n    });\n  }\n}\n\n// Calculate totals and summaries\nconst hasUpsellOpportunity = upsellOpportunities.length > 0;\nconst hasOptimizationOpportunity = optimizationOpportunities.length > 0;\nconst totalReduction = optimizationOpportunities.reduce((sum, a) => sum + a.reductionAmount, 0);\n\n// Count Business upgrade opportunities\nconst basicStandardCount = upsellOpportunities.filter(o => o.canUpgradeToPremium).length;\nconst defenderPlan1Count = upsellOpportunities.filter(o => o.redundantWithPremium).length;\nconst premiumCount = upsellOpportunities.filter(o => o.isBusinessPremium).length;\n\n// Count Enterprise E3 security opportunities\nconst e3Count = upsellOpportunities.filter(o => o.isEnterpriseE3).length;\nconst e3NeedsSecurityCount = upsellOpportunities.filter(o => o.needsE5Security).length;\nconst e3UsersWithoutSecurity = totalE3Users - e5SecurityCount;\n\n// Count upsell opportunities with unused licenses (potential reduction at renewal)\nconst upsellWithUnusedCount = upsellOpportunities.filter(o => o.unusedCount > 0).length;\n\n// Determine if upsell is actionable (something to discuss with customer)\n// Actionable if: can upgrade, has redundant licenses, needs E3 security, or has unused licenses\nconst hasActionableUpsell = basicStandardCount > 0 ||\n                            defenderPlan1Count > 0 ||\n                            e3NeedsSecurityCount > 0 ||\n                            upsellWithUnusedCount > 0;\n\n// Business 300-user limit check\nconst isApproachingBusinessLimit = totalBusinessPremiumUsers >= BUSINESS_USER_WARNING_THRESHOLD;\nconst hasExceededBusinessLimit = totalBusinessPremiumUsers >= BUSINESS_USER_LIMIT;\nconst businessLimitWarning = isApproachingBusinessLimit\n  ? hasExceededBusinessLimit\n    ? `CRITICAL: ${totalBusinessPremiumUsers} Business Premium users - exceeds 300-user limit! Migration to Enterprise required.`\n    : `WARNING: ${totalBusinessPremiumUsers} Business Premium users - approaching 300-user limit. Plan migration to Enterprise.`\n  : null;\n\n// Determine if any ticket is needed\n// Create ticket for any upsell opportunity (for logging), but auto-close if not actionable\nconst needsTicket = hasUpsellOpportunity || hasOptimizationOpportunity;\n\n// Get earliest renewal date for ticket summary\nlet earliestRenewalDate = null;\nconst allOpportunities = [...upsellOpportunities, ...optimizationOpportunities];\nif (allOpportunities.length > 0) {\n  // Filter out null/invalid renewal dates\n  const validDates = allOpportunities\n    .filter(o => o.renewalDate)\n    .map(o => new Date(o.renewalDate))\n    .filter(d => !isNaN(d.getTime()));\n\n  if (validDates.length > 0) {\n    earliestRenewalDate = new Date(Math.min(...validDates));\n  }\n}\n\nconst formatDate = (date) => {\n  if (!date || isNaN(date.getTime())) return null;\n  const year = date.getFullYear();\n  const month = String(date.getMonth() + 1).padStart(2, '0');\n  const day = String(date.getDate()).padStart(2, '0');\n  return `${year}-${month}-${day}`;\n};\n\n// Use today's date as fallback if no valid renewal date found\nconst renewalDateStr = formatDate(earliestRenewalDate) || formatDate(new Date());\n\n// Build ticket summary based on what opportunities exist\nlet ticketSummary = '';\nif (isApproachingBusinessLimit) {\n  ticketSummary = `Microsoft 365 License Limit Warning - ${customer.companyName}`;\n} else if (hasUpsellOpportunity && hasOptimizationOpportunity) {\n  ticketSummary = `Microsoft NCE License Review - ${renewalDateStr}`;\n} else if (hasUpsellOpportunity) {\n  ticketSummary = `Microsoft NCE License Renewal - ${renewalDateStr}`;\n} else if (hasOptimizationOpportunity) {\n  ticketSummary = `Microsoft NCE License Optimization - ${renewalDateStr}`;\n} else if (e3UsersWithoutSecurity > 0) {\n  ticketSummary = `Microsoft E3 Security Review - ${customer.companyName}`;\n}\n\n// Determine if ticket is needed (includes new triggers)\nconst hasE3SecurityOpportunity = e3NeedsSecurityCount > 0 || e3UsersWithoutSecurity > 0;\nconst hasBusinessLimitWarning = isApproachingBusinessLimit;\nconst needsTicketFinal = needsTicket || hasE3SecurityOpportunity || hasBusinessLimitWarning;\n\n// Determine if ticket should auto-close after creation\n// Auto-close if: no actionable upsell AND no E3 security gap AND no business limit warning\nconst shouldAutoClose = !hasActionableUpsell && !hasE3SecurityOpportunity && !hasBusinessLimitWarning;\n\nreturn [{\n  json: {\n    // Company info from v5 sub-workflow\n    customerName: customer.companyName,\n    domainName: customer.domainName,\n    cwCompanyId: customer.cwCompanyId,\n    huduCompanyId: customer.huduCompanyId,\n    sherwebId: customer.identifiers?.sherwebId,\n    microsoftTenantId: customer.identifiers?.microsoftTenantId,\n\n    // Combined opportunity flags\n    needsTicket: needsTicketFinal,\n    hasAnyOpportunity: needsTicketFinal,\n\n    // ALL licenses with status indicators (for ticket display)\n    allLicenses,\n    totalLicenseCount: allLicenses.length,\n\n    // Upsell opportunity data (60-day window)\n    hasUpsellOpportunity,\n    upsellCount: upsellOpportunities.length,\n    upsellOpportunities,\n\n    // Business upgrade breakdown\n    basicStandardCount,      // Can upgrade to Premium\n    defenderPlan1Count,      // Redundant if they get Premium\n    premiumCount,            // Already on Premium\n    upsellWithUnusedCount,   // Upsell licenses with unused seats\n    hasActionableUpsell,     // Is there something to discuss?\n\n    // Enterprise E3 security opportunity\n    hasE3SecurityOpportunity,\n    e3Count,                 // E3 licenses renewing\n    e3NeedsSecurityCount,    // E3 renewing without E5 Security\n    totalE3Users,            // Total E3 users\n    hasE5Security,           // Has any E5 Security licenses\n    e5SecurityCount,         // Number of E5 Security licenses\n    e3UsersWithoutSecurity,  // E3 users missing security add-on\n\n    // Business 300-user limit\n    hasBusinessLimitWarning,\n    isApproachingBusinessLimit,\n    hasExceededBusinessLimit,\n    totalBusinessPremiumUsers,\n    businessLimitWarning,\n\n    // Optimization opportunity data (post-renewal window)\n    hasOptimizationOpportunity,\n    optimizationCount: optimizationOpportunities.length,\n    totalReduction,\n    optimizationOpportunities,\n\n    // Ticket info\n    ticketSummary,\n    earliestRenewalDate: renewalDateStr,\n    shouldAutoClose,          // Auto-close if nothing actionable\n\n    message: needsTicketFinal\n      ? 'Opportunities found'\n      : 'No opportunities within renewal windows'\n  }\n}];\n"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6096,
+        1264
+      ],
+      "name": "Analyze Licenses",
+      "id": "f0f04a02-2143-4f4e-9612-0b8019b2770c"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "needs-ticket-condition",
+              "leftValue": "={{ $json.needsTicket }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        6320,
+        1264
+      ],
+      "name": "If Needs Ticket",
+      "id": "1c00e11f-f031-48fd-9f45-42e803a0c788"
+    },
+    {
+      "parameters": {
+        "resource": "ticket",
+        "operation": "getAll",
+        "returnAll": true,
+        "orderBy": "id",
+        "descending": true,
+        "conditions": "=summary contains \"NCE License\" AND company/id={{ $json.cwCompanyId }} AND closedFlag=false",
+        "fields": [
+          "id",
+          "summary",
+          "recordType",
+          "board",
+          "status",
+          "company",
+          "closedFlag"
+        ]
+      },
+      "type": "@mspcopilot/n8n-nodes-connectwise.connectWisePsa",
+      "typeVersion": 1,
+      "position": [
+        6544,
+        1264
+      ],
+      "name": "Search for Existing Ticket",
+      "alwaysOutputData": true,
+      "retryOnFail": true,
+      "id": "8ac0374f-15d7-4983-8a2d-919f6a268b0f",
+      "credentials": {
+        "connectWisePsaApi": {
+          "id": "7VgXPO3KBuoxqjmW",
+          "name": "ConnectWise PSA account"
+        }
+      },
+      "notes": "Single ticket per company - finds any open NCE license ticket"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "no-existing-ticket",
+              "leftValue": "={{ $json.id }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "boolean",
+                "operation": "notExists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "looseTypeValidation": true,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        6768,
+        1264
+      ],
+      "name": "If No Existing Ticket",
+      "id": "fe16bf4b-60aa-4a95-8b10-3e6377c6a945"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format Combined Ticket for NCE License Review\n// Version: v6 - Added shouldAutoClose support for \"nothing to do\" tickets\n// Input: Analysis data from Analyze Licenses, Pricing data from Sherweb\n// Output: ticketTitle, ticketBody for ConnectWise ticket\n\nconst data = $('Analyze Licenses').item.json;\nconst pricingResponse = $('Get customer subscription pricing').all().map(i => i.json);\n\nif (!data) {\n  throw new Error('Missing license analysis data');\n}\n\n// Sherweb returns { items: [...] } - flatten to get all pricing items\nconst pricingItems = [];\nfor (const response of pricingResponse) {\n  if (response.items && Array.isArray(response.items)) {\n    pricingItems.push(...response.items);\n  }\n}\n\n// Build pricing lookup by subscription ID\nconst pricingBySubscription = {};\nfor (const price of pricingItems) {\n  if (price.id) {\n    pricingBySubscription[price.id] = price;\n  }\n}\n\n// Helper to get price for a subscription\nconst getPrice = (cspSubscriptionId) => {\n  const pricing = pricingBySubscription[cspSubscriptionId];\n  if (pricing && pricing.fees && pricing.fees.recurringFee !== undefined) {\n    return parseFloat(pricing.fees.recurringFee) || 0;\n  }\n  return null;\n};\n\n// Helper to format currency\nconst formatCurrency = (amount) => {\n  if (amount === null || amount === undefined) return '';\n  return `$${amount.toFixed(2)}`;\n};\n\n// Helper to format date safely\nconst formatDate = (dateStr) => {\n  if (!dateStr) return 'Unknown';\n  return dateStr.split('T')[0];\n};\n\n// Build ticket title\nconst ticketTitle = data.ticketSummary;\n\n// Build ticket body - CONDENSED FORMAT\nlet body = '';\n\n// Header\nbody += `Microsoft NCE License Review - ${data.customerName}\\n`;\nbody += `${'='.repeat(50)}\\n`;\nbody += `Domain: ${data.domainName}\\n`;\nif (data.earliestRenewalDate) {\n  body += `Renewal: ${data.earliestRenewalDate}\\n`;\n}\nbody += `\\n`;\n\n// ACTION REQUIRED section (most important - at top)\nbody += `ACTION REQUIRED\\n`;\nbody += `${'-'.repeat(20)}\\n`;\n\nif (data.hasBusinessLimitWarning) {\n  if (data.hasExceededBusinessLimit) {\n    body += `> [CRITICAL] ${data.totalBusinessPremiumUsers} Business Premium users - exceeds 300 limit\\n`;\n    body += `> Schedule migration to Enterprise immediately\\n`;\n  } else {\n    body += `> [WARNING] ${data.totalBusinessPremiumUsers}/300 Business Premium users\\n`;\n    body += `> Plan migration to Enterprise before limit reached\\n`;\n  }\n}\n\nif (data.hasUpsellOpportunity && data.hasActionableUpsell) {\n  body += `> Contact customer about ${data.upsellCount} license(s) renewing soon\\n`;\n  if (data.basicStandardCount > 0) {\n    body += `> ${data.basicStandardCount} upgrade candidate(s) (Basic/Standard -> Premium)\\n`;\n  }\n  if (data.upsellWithUnusedCount > 0) {\n    body += `> ${data.upsellWithUnusedCount} license(s) with unused seats to review\\n`;\n  }\n}\n\nif (data.hasOptimizationOpportunity) {\n  body += `> ${data.totalReduction} unused license(s) will auto-reduce\\n`;\n}\n\nif (data.hasE3SecurityOpportunity && data.e3UsersWithoutSecurity > 0) {\n  body += `> ${data.e3UsersWithoutSecurity} E3 user(s) without E5 Security\\n`;\n}\n\n// If nothing actionable, indicate this is for logging only\nif (data.shouldAutoClose) {\n  body += `> [AUTO-CLOSED] No action required - logged for audit purposes\\n`;\n}\n\nbody += `\\n`;\n\n// Group licenses by window status\nconst upsellLicenses = data.allLicenses.filter(l => l.windowStatus === 'upsell');\nconst optimizationLicenses = data.allLicenses.filter(l => l.windowStatus === 'optimization');\nconst outsideLicenses = data.allLicenses.filter(l => l.windowStatus === 'outside');\n\n// RENEWING SOON section\nif (upsellLicenses.length > 0) {\n  body += `RENEWING SOON (1-60 days)\\n`;\n  body += `${'-'.repeat(25)}\\n`;\n\n  for (const lic of upsellLicenses) {\n    const unitPrice = getPrice(lic.cspSubscriptionId);\n    const commitmentBadge = lic.commitmentType === 'Monthly' ? '[MONTHLY]' : lic.commitmentType === 'Annual' ? '[ANNUAL]' : '';\n    let line = `${commitmentBadge} ${lic.licenseName}`;\n    if (lic.canUpgradeToPremium) line += ` [UPGRADE]`;\n    if (lic.redundantWithPremium) line += ` [REDUNDANT]`;\n    body += `${line}\\n`;\n\n    let details = `  Commitment: ${lic.commitmentType || 'Unknown'}`;\n    details += ` | ${lic.usedCount}/${lic.currentQuantity} used`;\n    details += ` | Renews: ${formatDate(lic.renewalDate)}`;\n    if (unitPrice !== null) details += ` | ${formatCurrency(unitPrice)}/mo`;\n    if (lic.unusedCount > 0) details += ` | ${lic.unusedCount} unused`;\n    body += `${details}\\n`;\n  }\n  body += `\\n`;\n}\n\n// AUTO-REDUCING section\nif (optimizationLicenses.length > 0) {\n  body += `AUTO-REDUCING (in cancellation window)\\n`;\n  body += `${'-'.repeat(35)}\\n`;\n\n  let totalSavings = 0;\n  for (const lic of optimizationLicenses) {\n    const unitPrice = getPrice(lic.cspSubscriptionId);\n    const savings = unitPrice !== null ? unitPrice * (lic.currentQuantity - lic.usedCount) : null;\n    if (savings) totalSavings += savings;\n\n    const commitmentBadge = lic.commitmentType === 'Monthly' ? '[MONTHLY]' : lic.commitmentType === 'Annual' ? '[ANNUAL]' : '';\n    body += `${commitmentBadge} ${lic.licenseName}\\n`;\n    let details = `  Commitment: ${lic.commitmentType || 'Unknown'}`;\n    details += ` | ${lic.currentQuantity} -> ${lic.usedCount} seats`;\n    if (savings) details += ` | Saves: ${formatCurrency(savings)}/mo`;\n    body += `${details}\\n`;\n  }\n\n  if (totalSavings > 0) {\n    body += `\\nTotal Savings: ${formatCurrency(totalSavings)}/mo (${formatCurrency(totalSavings * 12)}/yr)\\n`;\n  }\n  body += `\\n`;\n}\n\n// OTHER LICENSES section (condensed)\nif (outsideLicenses.length > 0) {\n  body += `OTHER LICENSES\\n`;\n  body += `${'-'.repeat(15)}\\n`;\n\n  for (const lic of outsideLicenses) {\n    const commitmentShort = lic.commitmentType === 'Monthly' ? 'M' : lic.commitmentType === 'Annual' ? 'A' : '?';\n    let line = `[${commitmentShort}] ${lic.licenseName}: ${lic.usedCount}/${lic.currentQuantity}`;\n    if (lic.renewalDate && lic.daysUntilRenewal > 0) {\n      line += ` | ${formatDate(lic.renewalDate)}`;\n    } else {\n      line += ` | ${lic.statusNote}`;\n    }\n    body += `${line}\\n`;\n  }\n  body += `\\n`;\n}\n\n// Footer with legend\nbody += `---\\n`;\nbody += `COMMITMENT TYPES:\\n`;\nbody += `[ANNUAL] = Annual commitment (1-year lock, can only reduce in 7-day window after renewal)\\n`;\nbody += `[MONTHLY] = Month-to-month (flexible, can reduce day before through 7 days after renewal)\\n`;\nbody += `[A] = Annual | [M] = Monthly\\n\\n`;\nbody += `Auto-generated by NCE License Review workflow`;\n\nreturn [{\n  json: {\n    ...data,\n    ticketTitle,\n    ticketBody: body\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7216,
+        1168
+      ],
+      "name": "Format Combined Ticket",
+      "id": "7c45286d-a896-41bd-8a9e-9383c3da29d7"
+    },
+    {
+      "parameters": {
+        "resource": "ticket",
+        "summary": "={{ $json.ticketTitle }}",
+        "company": {
+          "__rl": true,
+          "value": "={{ $json.cwCompanyId }}",
+          "mode": "id"
+        },
+        "board": 71,
+        "status": 1433,
+        "priority": 17,
+        "type": 921,
+        "subType": 3646,
+        "item": 3480,
+        "initialDescription": "=",
+        "initialInternalAnalysis": "={{ $json.ticketBody }}",
+        "additionalTicketFields": {},
+        "assignments": {
+          "assignments": [
+            {
+              "id": "ecb25ae3-0d57-4e21-8e85-45aeae62257c",
+              "name": "=requiredDate",
+              "value": "={{ $json.earliestRenewalDate }}T00:00:00Z",
+              "type": "date"
+            }
+          ]
+        }
+      },
+      "type": "@mspcopilot/n8n-nodes-connectwise.connectWisePsa",
+      "typeVersion": 1,
+      "position": [
+        7440,
+        1168
+      ],
+      "name": "Create Ticket",
+      "retryOnFail": true,
+      "id": "287cc648-9996-442e-9c34-6d2516891c2e",
+      "credentials": {
+        "connectWisePsaApi": {
+          "id": "7VgXPO3KBuoxqjmW",
+          "name": "ConnectWise PSA account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Capture ticket ID from various sources\n// Handles: new ticket creation, existing ticket update, or status update path\n\nconst analysisData = $('Analyze Licenses').item.json;\nconst inputData = $input.first()?.json || {};\n\nlet ticketId = null;\nlet ticketSource = 'none';\n\n// First check if input has existingTicketId (from Add Status Update path)\nif (inputData.existingTicketId) {\n  ticketId = inputData.existingTicketId;\n  ticketSource = 'existing';\n}\n\n// Try Create Ticket node (new ticket path)\nif (!ticketId) {\n  try {\n    const createdTicket = $('Create Ticket').item?.json;\n    if (createdTicket && createdTicket.id) {\n      ticketId = createdTicket.id;\n      ticketSource = 'created';\n    }\n  } catch (e) {}\n}\n\n// Fallback to search result\nif (!ticketId) {\n  try {\n    const searchResult = $('Search for Existing Ticket').item?.json;\n    if (searchResult && searchResult.id) {\n      ticketId = searchResult.id;\n      ticketSource = 'existing';\n    }\n  } catch (e) {}\n}\n\nreturn [{\n  json: {\n    ...analysisData,\n    ...inputData,\n    ticketId,\n    ticketSource,\n    hasTicketId: !!ticketId\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7664,
+        1264
+      ],
+      "name": "Capture Ticket ID",
+      "id": "b1722f01-6704-40bd-99cd-caa6bc8719a7"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "has-optimization",
+              "leftValue": "={{ $json.hasOptimizationOpportunity }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        7888,
+        1264
+      ],
+      "name": "If Needs Reduction",
+      "id": "df6d62cd-76c4-4dcb-8c9b-4f9ca74a6ae1",
+      "notes": "Check if optimization opportunities exist (7-day window)"
+    },
+    {
+      "parameters": {
+        "resource": "subscription",
+        "operation": "createSubscriptionsAmendment",
+        "customerId": "={{ $json.sherwebId }}",
+        "subscriptionAmendmentParameters": "={{ JSON.stringify($json.optimizationOpportunities.map(opp => ({ subscriptionId: opp.cspSubscriptionId, newQuantity: opp.newQuantity }))) }}",
+        "requestOptions": {}
+      },
+      "type": "@n8layer/n8n-nodes-sherweb.sherweb",
+      "typeVersion": 1,
+      "position": [
+        8112,
+        1168
+      ],
+      "name": "Schedule License Reduction",
+      "id": "34d1c1f2-c558-4d66-88ec-0637a6987bab",
+      "credentials": {
+        "sherwebOAuth2Api": {
+          "id": "9EYecxTN2IHfQaaw",
+          "name": "Sherweb account"
+        }
+      },
+      "notes": "Submit amendment to schedule license reduction for renewal date"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format Ticket Note After License Reduction Scheduled\n// Version: v4 - Concise format for single-ticket-per-company\n\nconst data = $('Capture Ticket ID').item.json;\nconst ticketId = data.ticketId;\nconst amendmentResponse = $('Schedule License Reduction').first().json;\nconst verifyResponse = $('Verify Subscription Changes').all().map(i => i.json);\n\nif (!data || !data.hasOptimizationOpportunity) {\n  return [{ json: { ...data, reductionNote: null, hasReductionNote: false, ticketId } }];\n}\n\n// Build verification lookup\nconst verifiedSubs = {};\nfor (const sub of verifyResponse) {\n  if (sub.items && Array.isArray(sub.items)) {\n    for (const item of sub.items) {\n      if (item.id) verifiedSubs[item.id] = item;\n    }\n  } else if (sub.id) {\n    verifiedSubs[sub.id] = sub;\n  }\n}\n\nconst today = new Date().toISOString().split('T')[0];\nlet note = `REDUCTION SCHEDULED - ${today}\\n`;\n\nlet totalReduced = 0;\nlet verifiedCount = 0;\nlet failedCount = 0;\nconst lines = [];\n\nfor (const opp of data.optimizationOpportunities) {\n  const verified = verifiedSubs[opp.cspSubscriptionId];\n  const scheduledQty = verified?.scheduledQuantity || verified?.quantity;\n  const isVerified = scheduledQty !== undefined && scheduledQty <= opp.newQuantity;\n  \n  if (isVerified) verifiedCount++;\n  else failedCount++;\n  \n  const status = isVerified ? 'OK' : '??';\n  const commit = opp.commitmentType === 'Monthly' ? 'M' : opp.commitmentType === 'Annual' ? 'A' : '?';\n  const effectiveDate = opp.renewalDate ? opp.renewalDate.split('T')[0] : 'TBD';\n  \n  lines.push(`[${status}][${commit}] ${opp.licenseName}: ${opp.currentQuantity}->${opp.newQuantity} (-${opp.reductionAmount}) eff ${effectiveDate}`);\n  totalReduced += opp.reductionAmount;\n}\n\nnote += lines.join('\\n');\nnote += `\\n\\nTotal: -${totalReduced} licenses | Verified: ${verifiedCount}/${lines.length}`;\n\nif (failedCount > 0) {\n  note += ` | CHECK SHERWEB`;\n}\n\nif (amendmentResponse?.subscriptionsAmendmentId) {\n  note += `\\nAmendment: ${amendmentResponse.subscriptionsAmendmentId}`;\n}\n\nreturn [{ json: { ...data, reductionNote: note, hasReductionNote: true, totalLicensesReduced: totalReduced, verifiedCount, failedCount, ticketId } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        8784,
+        1168
+      ],
+      "name": "Format Reduction Note",
+      "id": "3a03ebe7-3172-4138-bd21-2959ee556621"
+    },
+    {
+      "parameters": {
+        "resource": "ticketNote",
+        "parentId": "={{ $json.ticketId }}",
+        "text": "={{ $json.reductionNote }}",
+        "internalAnalysisFlag": true,
+        "processNotifications": false,
+        "member": "={{ 227 }}"
+      },
+      "type": "@mspcopilot/n8n-nodes-connectwise.connectWisePsa",
+      "typeVersion": 1,
+      "position": [
+        9008,
+        1168
+      ],
+      "name": "Add Ticket Note",
+      "id": "d7cc73c1-6e94-4d01-b918-6f6dfbe2b118",
+      "credentials": {
+        "connectWisePsaApi": {
+          "id": "7VgXPO3KBuoxqjmW",
+          "name": "ConnectWise PSA account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "should-auto-close",
+              "leftValue": "={{ $('Capture Ticket ID').item.json.shouldAutoClose }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        9232,
+        1168
+      ],
+      "name": "Should Auto-Close?",
+      "id": "3d5f1ccb-c6e2-43d8-8306-ca5b1223e15d",
+      "notes": "Auto-close if nothing actionable (optimization-only or 'nothing to do' upsell)"
+    },
+    {
+      "parameters": {
+        "resource": "ticket",
+        "operation": "update",
+        "id": "={{ $json.ticketId }}",
+        "company": {
+          "__rl": true,
+          "mode": "list",
+          "value": ""
+        },
+        "board": 71,
+        "status": 1436,
+        "additionalTicketFields": {}
+      },
+      "type": "@mspcopilot/n8n-nodes-connectwise.connectWisePsa",
+      "typeVersion": 1,
+      "position": [
+        9456,
+        1344
+      ],
+      "name": "Close Ticket",
+      "id": "dba95d8e-37e2-452e-bf8b-430397a722b5",
+      "credentials": {
+        "connectWisePsaApi": {
+          "id": "7VgXPO3KBuoxqjmW",
+          "name": "ConnectWise PSA account"
+        }
+      },
+      "notes": "Auto-close tickets with nothing actionable"
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "value": "j366A7Atc_IrsdxIzf9N6",
+          "mode": "list",
+          "cachedResultUrl": "/workflow/j366A7Atc_IrsdxIzf9N6",
+          "cachedResultName": "Get All Company Identifiers from Hudu"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.3,
+      "position": [
+        5200,
+        1600
+      ],
+      "name": "Hudu: Retrieve Tenant IDs",
+      "id": "d73b7fff-02b9-4943-8d68-3d0df53a1134"
+    },
+    {
+      "parameters": {
+        "resource": "subscription",
+        "operation": "getCustomerSubscriptionPricing",
+        "customerId": "={{ $('Analyze Licenses').item.json.sherwebId }}",
+        "requestOptions": {}
+      },
+      "type": "@n8layer/n8n-nodes-sherweb.sherweb",
+      "typeVersion": 1,
+      "position": [
+        6992,
+        1168
+      ],
+      "name": "Get customer subscription pricing",
+      "retryOnFail": true,
+      "id": "d07bc1cb-eb22-4d07-9ba9-1945e0344d4d",
+      "credentials": {
+        "sherwebOAuth2Api": {
+          "id": "9EYecxTN2IHfQaaw",
+          "name": "Sherweb account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract existing ticket ID from search results\nconst searchResult = $input.first().json;\nconst analysisData = $('Analyze Licenses').item.json;\n\nreturn [{\n  json: {\n    ...analysisData,\n    existingTicketId: searchResult.id,\n    existingTicketSummary: searchResult.summary,\n    existingTicketClosed: searchResult.closedFlag\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6992,
+        1360
+      ],
+      "name": "Extract Existing Ticket",
+      "id": "97667541-9319-40e9-a317-6cb889929e14"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format concise status update for existing ticket\nconst data = $input.first().json;\nconst today = new Date().toISOString().split('T')[0];\n\nlet note = `STATUS UPDATE - ${today}\\n`;\n\n// Summary counts\nconst upsellCount = data.upsellOpportunities?.length || 0;\nconst optCount = data.optimizationOpportunities?.length || 0;\nconst totalReduction = data.totalReduction || 0;\n\nif (optCount > 0) {\n  note += `ACTION: ${optCount} license(s) ready to reduce (-${totalReduction} total)\\n`;\n} else if (upsellCount > 0) {\n  note += `REVIEW: ${upsellCount} license(s) renewing soon\\n`;\n} else {\n  note += `No action needed - all licenses current\\n`;\n}\n\n// Quick license summary (one line each)\nconst allLics = data.allLicenses || [];\nconst actionable = allLics.filter(l => l.windowStatus === 'optimization' || l.windowStatus === 'upsell');\n\nif (actionable.length > 0 && actionable.length <= 5) {\n  for (const lic of actionable) {\n    const commit = lic.commitmentType === 'Monthly' ? 'M' : lic.commitmentType === 'Annual' ? 'A' : '?';\n    const status = lic.windowStatus === 'optimization' ? 'REDUCE' : 'REVIEW';\n    note += `[${commit}] ${lic.licenseName}: ${lic.usedCount}/${lic.currentQuantity} - ${status}\\n`;\n  }\n} else if (actionable.length > 5) {\n  note += `${actionable.length} licenses need attention (see original ticket)\\n`;\n}\n\nreturn [{ json: { ...data, statusNote: note } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7216,
+        1360
+      ],
+      "name": "Format Status Update",
+      "id": "9b7c69a6-48cd-432d-b7c4-06cac60bc16a"
+    },
+    {
+      "parameters": {
+        "resource": "ticketNote",
+        "parentId": "={{ $json.existingTicketId }}",
+        "text": "={{ $json.statusNote }}",
+        "internalAnalysisFlag": true,
+        "processNotifications": false,
+        "member": "={{ 227 }}"
+      },
+      "type": "@mspcopilot/n8n-nodes-connectwise.connectWisePsa",
+      "typeVersion": 1,
+      "position": [
+        7440,
+        1360
+      ],
+      "name": "Add Status Update",
+      "id": "332697b8-ed2e-4d29-b4e4-7654a767ea37",
+      "credentials": {
+        "connectWisePsaApi": {
+          "id": "7VgXPO3KBuoxqjmW",
+          "name": "ConnectWise PSA account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "should-auto-close-no-reduction",
+              "leftValue": "={{ $json.shouldAutoClose }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        8112,
+        1360
+      ],
+      "name": "Should Auto-Close? (No Reduction)",
+      "id": "bb36fa27-fbf2-4658-9153-74efd76be309",
+      "notes": "For upsell-only tickets with nothing actionable (like Hohner 6/6 Premium)"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {}
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.3,
+      "position": [
+        4976,
+        1600
+      ],
+      "name": "Schedule Trigger",
+      "id": "2d92f8d8-08e7-4890-b2d1-27fa9336a84d"
+    },
+    {
+      "parameters": {
+        "amount": 60
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        8336,
+        1168
+      ],
+      "name": "Wait 60s for Amendment",
+      "id": "14ab81f4-a329-4b90-9cd4-ef393a44732e",
+      "webhookId": "fdf997e9-e3c1-4f4d-9f28-76e324a7b0aa"
+    },
+    {
+      "parameters": {
+        "resource": "subscription",
+        "operation": "getCustomerSubscriptionDetails",
+        "customerId": "={{ $('Capture Ticket ID').item.json.sherwebId }}",
+        "requestOptions": {}
+      },
+      "type": "@n8layer/n8n-nodes-sherweb.sherweb",
+      "typeVersion": 1,
+      "position": [
+        8560,
+        1168
+      ],
+      "name": "Verify Subscription Changes",
+      "id": "e4a4ddf0-17b9-43ed-aa37-4636dfac7437",
+      "credentials": {
+        "sherwebOAuth2Api": {
+          "id": "9EYecxTN2IHfQaaw",
+          "name": "Sherweb account"
+        }
+      },
+      "notes": "Re-fetch subscriptions after 60s to verify amendment was applied"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Loop Over Items": {
+      "main": [
+        [
+          {
+            "node": "Done",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Has Sherweb ID?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Sherweb ID?": {
+      "main": [
+        [
+          {
+            "node": "Get Licenses (CIPP)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Licenses (CIPP)": {
+      "main": [
+        [
+          {
+            "node": "Analyze Licenses",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze Licenses": {
+      "main": [
+        [
+          {
+            "node": "If Needs Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Needs Ticket": {
+      "main": [
+        [
+          {
+            "node": "Search for Existing Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search for Existing Ticket": {
+      "main": [
+        [
+          {
+            "node": "If No Existing Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If No Existing Ticket": {
+      "main": [
+        [
+          {
+            "node": "Get customer subscription pricing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Extract Existing Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Combined Ticket": {
+      "main": [
+        [
+          {
+            "node": "Create Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Create Ticket": {
+      "main": [
+        [
+          {
+            "node": "Capture Ticket ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Existing Ticket": {
+      "main": [
+        [
+          {
+            "node": "Format Status Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Status Update": {
+      "main": [
+        [
+          {
+            "node": "Add Status Update",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add Status Update": {
+      "main": [
+        [
+          {
+            "node": "Capture Ticket ID",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Capture Ticket ID": {
+      "main": [
+        [
+          {
+            "node": "If Needs Reduction",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Needs Reduction": {
+      "main": [
+        [
+          {
+            "node": "Schedule License Reduction",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Should Auto-Close? (No Reduction)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule License Reduction": {
+      "main": [
+        [
+          {
+            "node": "Wait 60s for Amendment",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 60s for Amendment": {
+      "main": [
+        [
+          {
+            "node": "Verify Subscription Changes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify Subscription Changes": {
+      "main": [
+        [
+          {
+            "node": "Format Reduction Note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Reduction Note": {
+      "main": [
+        [
+          {
+            "node": "Add Ticket Note",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add Ticket Note": {
+      "main": [
+        [
+          {
+            "node": "Should Auto-Close?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Auto-Close?": {
+      "main": [
+        [
+          {
+            "node": "Close Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Close Ticket": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Hudu: Retrieve Tenant IDs": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get customer subscription pricing": {
+      "main": [
+        [
+          {
+            "node": "Format Combined Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Should Auto-Close? (No Reduction)": {
+      "main": [
+        [
+          {
+            "node": "Close Ticket",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Over Items",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule Trigger": {
+      "main": [
+        [
+          {
+            "node": "Hudu: Retrieve Tenant IDs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {
+    "executionOrder": "v1",
+    "availableInMCP": false,
+    "callerPolicy": "workflowsFromSameOwner"
+  },
+  "versionId": "4d819d71-857b-44c2-8556-6d2e9b2dfbff",
+  "meta": {
+    "templateCredsSetupCompleted": true,
+    "instanceId": "80d72caeac3cefe7bf8aee6495b28a7b47d922fce64f983144002889029cc5f5"
+  },
+  "id": "XNxUVwWLGSO1S6mj5M6Lc",
+  "tags": [
+    {
+      "updatedAt": "2026-01-26T01:15:57.832Z",
+      "createdAt": "2026-01-26T01:15:57.832Z",
+      "id": "6IOYUPPDeWbVRKKF",
+      "name": "scheduled"
+    },
+    {
+      "updatedAt": "2025-12-18T21:52:53.270Z",
+      "createdAt": "2025-12-18T21:52:53.270Z",
+      "id": "MxxcmEQ0P1gyCitH",
+      "name": "CIPP"
+    },
+    {
+      "updatedAt": "2026-01-26T02:04:37.164Z",
+      "createdAt": "2025-12-18T21:52:48.337Z",
+      "id": "mmKJmuv9o1GP4QUT",
+      "name": "sherweb"
+    }
+  ]
+}
