@@ -1,0 +1,259 @@
+{
+  "name": "CW: Expense Report Reminder",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 9 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "5ec1d389-7ee8-4df8-86d2-8b46a8e81179",
+      "name": "Daily 9 AM (Weekdays)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-640, -216]
+    },
+    {
+      "parameters": {
+        "url": "https://api-na.myconnectwise.net/v4_6_release/apis/3.0/expense/reports",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "connectWisePsaApi",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "conditions",
+              "value": "status = 'Open' AND year >= 2026"
+            },
+            {
+              "name": "pageSize",
+              "value": "1000"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "87d7d5bc-3853-4711-b7c2-d66daeba1de0",
+      "name": "Fetch Open Expense Reports",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-416, -96],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 1
+          },
+          "conditions": [
+            {
+              "id": "has-expenses",
+              "leftValue": "={{ $input.all().length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "d38511cd-414e-4268-a135-3142ed45fee1",
+      "name": "Has Expenses?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [-192, -96]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Group expense reports by member\nconst reports = $input.all();\nconst now = new Date();\n\n// ============================================\n// CONFIGURE YOUR EMAIL DOMAIN HERE\n// ============================================\nconst EMAIL_DOMAIN = '@yourcompany.com';\n\n// Group by member\nconst byMember = {};\n\nfor (const report of reports) {\n  const r = report.json;\n  const memberId = r.member?.identifier || 'Unknown';\n  const memberName = r.member?.name || 'Unknown';\n  const memberEmail = r.member?.identifier ? `${r.member.identifier}${EMAIL_DOMAIN}` : null;\n  \n  if (!byMember[memberId]) {\n    byMember[memberId] = {\n      memberId,\n      memberName,\n      memberEmail,\n      reports: [],\n      totalAmount: 0,\n      oldestReportDate: null\n    };\n  }\n  \n  // Calculate age in days from dateEnd\n  const reportEndDate = new Date(r.dateEnd);\n  const ageDays = Math.floor((now - reportEndDate) / (1000 * 60 * 60 * 24));\n  \n  byMember[memberId].reports.push({\n    id: r.id,\n    period: r.period,\n    year: r.year,\n    dateStart: r.dateStart,\n    dateEnd: r.dateEnd,\n    dueDate: r.dueDate,\n    ageDays,\n    total: r.total || 0\n  });\n  \n  byMember[memberId].totalAmount += (r.total || 0);\n  \n  // Track oldest report\n  if (!byMember[memberId].oldestReportDate || reportEndDate < new Date(byMember[memberId].oldestReportDate)) {\n    byMember[memberId].oldestReportDate = r.dateEnd;\n  }\n}\n\n// Convert to array and add summary\nreturn Object.values(byMember).map(member => {\n  const oldestDate = new Date(member.oldestReportDate);\n  const oldestAgeDays = Math.floor((now - oldestDate) / (1000 * 60 * 60 * 24));\n  \n  return {\n    json: {\n      ...member,\n      reportCount: member.reports.length,\n      oldestAgeDays\n    }\n  };\n});"
+      },
+      "id": "f8e58bdc-7448-450b-8e68-9fb9cf872273",
+      "name": "Group by Member",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [32, -216]
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "id": "loop-each-member",
+      "name": "Loop Each Member",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [256, -216]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format the email body for each member\nconst member = $input.item.json;\n\n// Build expense report table rows\nlet tableRows = member.reports\n  .sort((a, b) => new Date(a.dateStart) - new Date(b.dateStart))\n  .map(r => {\n    const startFormatted = new Date(r.dateStart).toLocaleDateString('en-US', {\n      month: 'short',\n      day: 'numeric'\n    });\n    const endFormatted = new Date(r.dateEnd).toLocaleDateString('en-US', {\n      month: 'short',\n      day: 'numeric',\n      year: 'numeric'\n    });\n    const dueFormatted = new Date(r.dueDate).toLocaleDateString('en-US', {\n      month: 'short',\n      day: 'numeric'\n    });\n    const ageWarning = r.ageDays > 7 ? ' ⚠️' : '';\n    const overdue = new Date(r.dueDate) < new Date() ? ' <span style=\"color: #dc3545;\">(OVERDUE)</span>' : '';\n    \n    return `<tr>\n      <td style=\"padding: 8px; border-bottom: 1px solid #eee;\">${startFormatted} - ${endFormatted}${ageWarning}</td>\n      <td style=\"padding: 8px; border-bottom: 1px solid #eee;\">$${r.total.toFixed(2)}</td>\n      <td style=\"padding: 8px; border-bottom: 1px solid #eee;\">${dueFormatted}${overdue}</td>\n    </tr>`;\n  })\n  .join('');\n\nconst urgencyNote = member.oldestAgeDays > 14 \n  ? `<p style=\"color: #dc3545; font-weight: bold;\">⚠️ You have expense reports that are ${member.oldestAgeDays} days overdue. Please submit as soon as possible.</p>`\n  : member.oldestAgeDays > 7\n  ? `<p style=\"color: #ffc107; font-weight: bold;\">⚠️ You have expense reports that are ${member.oldestAgeDays} days old.</p>`\n  : '';\n\nconst emailBody = `\n<html>\n<body style=\"font-family: Arial, sans-serif; max-width: 800px; margin: 0 auto;\">\n  <h2 style=\"color: #333;\">Expense Report Reminder</h2>\n  \n  <p>Hi ${member.memberName.split(' ')[0]},</p>\n  \n  <p>You have <strong>${member.reportCount} unsubmitted expense report${member.reportCount > 1 ? 's' : ''}</strong> totaling <strong>$${member.totalAmount.toFixed(2)}</strong> that need to be submitted.</p>\n  \n  ${urgencyNote}\n  \n  <table style=\"width: 100%; border-collapse: collapse; margin: 20px 0;\">\n    <thead>\n      <tr style=\"background-color: #f8f9fa;\">\n        <th style=\"padding: 10px; text-align: left; border-bottom: 2px solid #dee2e6;\">Period</th>\n        <th style=\"padding: 10px; text-align: left; border-bottom: 2px solid #dee2e6;\">Amount</th>\n        <th style=\"padding: 10px; text-align: left; border-bottom: 2px solid #dee2e6;\">Due Date</th>\n      </tr>\n    </thead>\n    <tbody>\n      ${tableRows}\n    </tbody>\n    <tfoot>\n      <tr style=\"background-color: #f8f9fa; font-weight: bold;\">\n        <td style=\"padding: 10px;\">Total</td>\n        <td style=\"padding: 10px;\">$${member.totalAmount.toFixed(2)}</td>\n        <td style=\"padding: 10px;\"></td>\n      </tr>\n    </tfoot>\n  </table>\n  \n  <p><strong>How to submit:</strong></p>\n  <ol>\n    <li>Log into ConnectWise</li>\n    <li>Go to <strong>Time & Expense → My Expense Reports</strong></li>\n    <li>Click on the report period, review your expenses</li>\n    <li>Click <strong>Submit</strong></li>\n  </ol>\n  \n  <p style=\"color: #666; font-size: 12px; margin-top: 30px;\">This is an automated reminder.</p>\n</body>\n</html>\n`;\n\nreturn [{\n  json: {\n    ...member,\n    emailSubject: `Expense Reminder: ${member.reportCount} unsubmitted report${member.reportCount > 1 ? 's' : ''} ($${member.totalAmount.toFixed(2)})`,\n    emailBody\n  }\n}];"
+      },
+      "id": "987d440e-e339-4b74-839c-04192aad08e3",
+      "name": "Format Email",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, -192]
+    },
+    {
+      "parameters": {
+        "fromEmail": "Automation <automation@yourcompany.com>",
+        "toEmail": "={{ $json.memberEmail }}",
+        "subject": "={{ $json.emailSubject }}",
+        "html": "={{ $json.emailBody }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "7587da87-8b2a-4c81-a8c8-95f097cec03c",
+      "name": "Send Reminder Email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [704, -160]
+    },
+    {
+      "parameters": {},
+      "id": "13105e79-de91-4720-b4bb-539a00e5c2d7",
+      "name": "No Expenses",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [32, -24]
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-640, -24],
+      "id": "ed7ac081-7895-4a60-ada7-b93e21596ba5",
+      "name": "When clicking 'Execute workflow'"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [480, -384],
+      "id": "d55b7249-4832-4ca0-8007-0dde85f7f5f2",
+      "name": "No Operation, do nothing"
+    }
+  ],
+  "connections": {
+    "Daily 9 AM (Weekdays)": {
+      "main": [
+        [
+          {
+            "node": "Fetch Open Expense Reports",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Open Expense Reports": {
+      "main": [
+        [
+          {
+            "node": "Has Expenses?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Expenses?": {
+      "main": [
+        [
+          {
+            "node": "Group by Member",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "No Expenses",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Group by Member": {
+      "main": [
+        [
+          {
+            "node": "Loop Each Member",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Each Member": {
+      "main": [
+        [
+          {
+            "node": "No Operation, do nothing",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Email": {
+      "main": [
+        [
+          {
+            "node": "Send Reminder Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reminder Email": {
+      "main": [
+        [
+          {
+            "node": "Loop Each Member",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "When clicking 'Execute workflow'": {
+      "main": [
+        [
+          {
+            "node": "Fetch Open Expense Reports",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "templateCredsSetupCompleted": true
+  }
+}
